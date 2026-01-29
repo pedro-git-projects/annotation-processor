@@ -4,10 +4,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// HelmPlaceholder stores the mapping between placeholder and original Helm expression
+type HelmPlaceholder struct {
+	Placeholder string
+	Original    string
+}
+
+var helmExprRegex = regexp.MustCompile(`\{\{[^}]*\}\}`)
 
 func main() {
 	// Directories to process
@@ -64,6 +73,33 @@ func processDirectory(dirPath string) error {
 	return nil
 }
 
+// replaceHelmExpressions replaces all {{ ... }} with placeholders and returns the mapping
+func replaceHelmExpressions(content string) (string, []HelmPlaceholder) {
+	var placeholders []HelmPlaceholder
+	counter := 0
+
+	result := helmExprRegex.ReplaceAllStringFunc(content, func(match string) string {
+		placeholder := fmt.Sprintf("__HELM_PLACEHOLDER_%d__", counter)
+		placeholders = append(placeholders, HelmPlaceholder{
+			Placeholder: placeholder,
+			Original:    match,
+		})
+		counter++
+		return placeholder
+	})
+
+	return result, placeholders
+}
+
+// restoreHelmExpressions restores the original Helm expressions from placeholders
+func restoreHelmExpressions(content string, placeholders []HelmPlaceholder) string {
+	result := content
+	for _, p := range placeholders {
+		result = strings.ReplaceAll(result, p.Placeholder, p.Original)
+	}
+	return result
+}
+
 func processFile(filePath string) error {
 	// Read the file
 	content, err := os.ReadFile(filePath)
@@ -71,9 +107,12 @@ func processFile(filePath string) error {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
 
+	// Replace Helm expressions with placeholders
+	sanitizedContent, placeholders := replaceHelmExpressions(string(content))
+
 	// Parse as yaml.Node to preserve structure
 	var doc yaml.Node
-	if err := yaml.Unmarshal(content, &doc); err != nil {
+	if err := yaml.Unmarshal([]byte(sanitizedContent), &doc); err != nil {
 		return fmt.Errorf("failed to parse YAML: %w", err)
 	}
 
@@ -141,8 +180,11 @@ func processFile(filePath string) error {
 	}
 	encoder.Close()
 
+	// Restore Helm expressions
+	finalContent := restoreHelmExpressions(buf.String(), placeholders)
+
 	// Write back to file
-	if err := os.WriteFile(filePath, []byte(buf.String()), 0644); err != nil {
+	if err := os.WriteFile(filePath, []byte(finalContent), 0644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -153,9 +195,12 @@ func addSpringJacksonConfig(embeddedYAML string) (string, bool, error) {
 	// Trim leading whitespace for parsing
 	trimmedYAML := strings.TrimLeft(embeddedYAML, "\n\r\t ")
 
+	// Replace Helm expressions in embedded YAML too
+	sanitizedYAML, placeholders := replaceHelmExpressions(trimmedYAML)
+
 	// Parse the embedded YAML as a generic map to preserve structure
 	var data yaml.Node
-	if err := yaml.Unmarshal([]byte(trimmedYAML), &data); err != nil {
+	if err := yaml.Unmarshal([]byte(sanitizedYAML), &data); err != nil {
 		return embeddedYAML, false, fmt.Errorf("failed to parse embedded YAML: %w", err)
 	}
 
@@ -260,6 +305,9 @@ marshal:
 	encoder.Close()
 
 	result := strings.TrimLeft(buf.String(), "\n\r\t ")
+
+	// Restore Helm expressions
+	result = restoreHelmExpressions(result, placeholders)
 
 	return result, true, nil
 }
