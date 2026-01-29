@@ -9,37 +9,14 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// OuterConfig represents the top-level YAML structure
-type OuterConfig struct {
-	Version    string      `yaml:"version"`
-	ConfigMaps []ConfigMap `yaml:"configmaps"`
-}
-
-// ConfigMap represents a single configmap entry
-type ConfigMap struct {
-	Name      string            `yaml:"name"`
-	Region    string            `yaml:"region"`
-	Namespace string            `yaml:"namespace"`
-	Data      map[string]string `yaml:"data"`
-}
-
-// JacksonConfig represents the jackson configuration
-type JacksonConfig struct {
-	DefaultPropertyInclusion string `yaml:"default-property-inclusion"`
-}
-
-// SpringConfig represents the spring configuration
-type SpringConfig struct {
-	Jackson JacksonConfig `yaml:"jackson"`
-}
-
 func main() {
 	// Directories to process
 	dirs := []string{
-		"dev/configmaps",
-		"cert-dev/configmaps",
-		"pre/configmaps",
-		"pro/configmaps",
+		"templates/clients",
+		"templates/connectors",
+		"templates/other",
+		"templates/pbcs",
+		"templates/workers",
 	}
 
 	// Get base directory from command line argument or use current directory
@@ -64,24 +41,23 @@ func processDirectory(dirPath string) error {
 		return fmt.Errorf("directory does not exist: %s", dirPath)
 	}
 
-	// Find all YAML files in the directory
-	files, err := filepath.Glob(filepath.Join(dirPath, "*.yaml"))
+	// Find all subdirectories (application folders)
+	entries, err := os.ReadDir(dirPath)
 	if err != nil {
 		return err
 	}
 
-	ymlFiles, err := filepath.Glob(filepath.Join(dirPath, "*.yml"))
-	if err != nil {
-		return err
-	}
-	files = append(files, ymlFiles...)
-
-	for _, file := range files {
-		fmt.Printf("Processing file: %s\n", file)
-		if err := processFile(file); err != nil {
-			fmt.Printf("  Error processing file %s: %v\n", file, err)
-		} else {
-			fmt.Printf("  Successfully processed: %s\n", file)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			configMapPath := filepath.Join(dirPath, entry.Name(), "configmap.yaml")
+			if _, err := os.Stat(configMapPath); err == nil {
+				fmt.Printf("Processing file: %s\n", configMapPath)
+				if err := processFile(configMapPath); err != nil {
+					fmt.Printf("  Error processing file %s: %v\n", configMapPath, err)
+				} else {
+					fmt.Printf("  Successfully processed: %s\n", configMapPath)
+				}
+			}
 		}
 	}
 
@@ -95,31 +71,58 @@ func processFile(filePath string) error {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
 
-	// Parse the outer YAML structure
-	var config OuterConfig
-	if err := yaml.Unmarshal(content, &config); err != nil {
+	// Parse as yaml.Node to preserve structure
+	var doc yaml.Node
+	if err := yaml.Unmarshal(content, &doc); err != nil {
 		return fmt.Errorf("failed to parse YAML: %w", err)
+	}
+
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return fmt.Errorf("invalid YAML document structure")
+	}
+
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("root is not a mapping")
+	}
+
+	// Find the data key
+	dataIndex := -1
+	for i := 0; i < len(root.Content); i += 2 {
+		if root.Content[i].Value == "data" {
+			dataIndex = i
+			break
+		}
+	}
+
+	if dataIndex < 0 {
+		return fmt.Errorf("no 'data' key found")
+	}
+
+	dataNode := root.Content[dataIndex+1]
+	if dataNode.Kind != yaml.MappingNode {
+		return fmt.Errorf("'data' is not a mapping")
 	}
 
 	modified := false
 
-	// Process each configmap
-	for i := range config.ConfigMaps {
-		cm := &config.ConfigMaps[i]
+	// Process each entry in data
+	for i := 0; i < len(dataNode.Content); i += 2 {
+		keyNode := dataNode.Content[i]
+		valueNode := dataNode.Content[i+1]
 
-		// Process each data entry
-		for key, value := range cm.Data {
-			if strings.HasSuffix(key, ".yaml") || strings.HasSuffix(key, ".yml") {
-				updatedValue, wasModified, err := addSpringJacksonConfig(value)
-				if err != nil {
-					fmt.Printf("    Warning: Could not process embedded YAML in %s: %v\n", key, err)
-					continue
-				}
-				if wasModified {
-					cm.Data[key] = updatedValue
-					modified = true
-					fmt.Printf("    Modified embedded config in: %s (region: %s)\n", key, cm.Region)
-				}
+		// Check if this is a string (embedded YAML)
+		if valueNode.Kind == yaml.ScalarNode && (valueNode.Style == yaml.LiteralStyle || valueNode.Style == yaml.FoldedStyle || valueNode.Tag == "!!str") {
+			updatedValue, wasModified, err := addSpringJacksonConfig(valueNode.Value)
+			if err != nil {
+				fmt.Printf("    Warning: Could not process embedded YAML in %s: %v\n", keyNode.Value, err)
+				continue
+			}
+			if wasModified {
+				valueNode.Value = updatedValue
+				valueNode.Style = yaml.LiteralStyle // Use |- style
+				modified = true
+				fmt.Printf("    Modified embedded config in: %s\n", keyNode.Value)
 			}
 		}
 	}
@@ -129,14 +132,17 @@ func processFile(filePath string) error {
 		return nil
 	}
 
-	// Marshal back to YAML with proper formatting
-	output, err := marshalWithPreservedFormat(&config)
-	if err != nil {
+	// Marshal back to YAML
+	var buf strings.Builder
+	encoder := yaml.NewEncoder(&buf)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&doc); err != nil {
 		return fmt.Errorf("failed to marshal YAML: %w", err)
 	}
+	encoder.Close()
 
 	// Write back to file
-	if err := os.WriteFile(filePath, output, 0644); err != nil {
+	if err := os.WriteFile(filePath, []byte(buf.String()), 0644); err != nil {
 		return fmt.Errorf("failed to write file: %w", err)
 	}
 
@@ -144,16 +150,19 @@ func processFile(filePath string) error {
 }
 
 func addSpringJacksonConfig(embeddedYAML string) (string, bool, error) {
+	// Trim leading whitespace for parsing
+	trimmedYAML := strings.TrimLeft(embeddedYAML, "\n\r\t ")
+
 	// Parse the embedded YAML as a generic map to preserve structure
 	var data yaml.Node
-	if err := yaml.Unmarshal([]byte(embeddedYAML), &data); err != nil {
+	if err := yaml.Unmarshal([]byte(trimmedYAML), &data); err != nil {
 		return embeddedYAML, false, fmt.Errorf("failed to parse embedded YAML: %w", err)
 	}
 
 	// Handle empty content
 	if data.Kind == 0 {
 		// Empty document, create new structure
-		newYAML := "\nspring:\n  jackson:\n    default-property-inclusion: non_null\n"
+		newYAML := "spring:\n  jackson:\n    default-property-inclusion: non_null\n"
 		return newYAML, true, nil
 	}
 
@@ -250,26 +259,8 @@ marshal:
 	}
 	encoder.Close()
 
-	result := buf.String()
-	// Ensure it starts with newline to match original format
-	if !strings.HasPrefix(result, "\n") {
-		result = "\n" + result
-	}
+	result := strings.TrimLeft(buf.String(), "\n\r\t ")
 
 	return result, true, nil
 }
 
-func marshalWithPreservedFormat(config *OuterConfig) ([]byte, error) {
-	var buf strings.Builder
-	buf.WriteString("---\n")
-
-	encoder := yaml.NewEncoder(&buf)
-	encoder.SetIndent(2)
-
-	if err := encoder.Encode(config); err != nil {
-		return nil, err
-	}
-	encoder.Close()
-
-	return []byte(buf.String()), nil
-}
